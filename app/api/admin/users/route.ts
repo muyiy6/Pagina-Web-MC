@@ -1,0 +1,396 @@
+import { NextResponse } from 'next/server';
+import { requireAdmin, requireOwner } from '@/lib/session';
+import dbConnect from '@/lib/mongodb';
+import User from '@/models/User';
+import AdminLog from '@/models/AdminLog';
+import Badge from '@/models/Badge';
+import bcrypt from 'bcryptjs';
+
+function getRequestIp(request: Request) {
+  const xff = request.headers.get('x-forwarded-for');
+  if (xff) return xff.split(',')[0].trim();
+  return request.headers.get('x-real-ip') || '';
+}
+
+function escapeRegex(text: string) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export async function GET() {
+  try {
+    await requireAdmin();
+    await dbConnect();
+    
+    const users = await User.find().select('-password').sort({ createdAt: -1 });
+    
+    return NextResponse.json(users);
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Forbidden: Admin access required') {
+      return NextResponse.json({ error: '未授权' }, { status: 403 });
+    }
+    
+    console.error('Error fetching users:', error);
+    return NextResponse.json(
+      { error: '获取用户失败' },
+      { status: 500 }
+    );
+  }
+}
+
+export async function POST(request: Request) {
+  try {
+    const owner = await requireOwner();
+    const body = await request.json().catch(() => ({}));
+
+    const username = typeof body.username === 'string' ? body.username.trim() : '';
+    const emailRaw = typeof body.email === 'string' ? body.email.trim() : '';
+    const email = emailRaw.toLowerCase();
+    const password = typeof body.password === 'string' ? body.password : '';
+    const role = typeof body.role === 'string' ? body.role : 'USER';
+
+    if (!username || username.length < 3 || username.length > 20 || !/^[a-zA-Z0-9_]+$/.test(username)) {
+      return NextResponse.json({ error: '用户名无效' }, { status: 400 });
+    }
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return NextResponse.json({ error: '邮箱无效' }, { status: 400 });
+    }
+
+    if (!password || password.length < 6) {
+      return NextResponse.json({ error: '密码无效（至少 6 个字符）' }, { status: 400 });
+    }
+
+    if (!['USER', 'STAFF', 'ADMIN', 'OWNER'].includes(role)) {
+      return NextResponse.json({ error: '角色无效' }, { status: 400 });
+    }
+
+    await dbConnect();
+
+    const emailExists = await User.findOne({ email }).select('_id').lean();
+    if (emailExists) {
+      return NextResponse.json({ error: '该邮箱已被使用' }, { status: 409 });
+    }
+
+    const usernameExists = await User.findOne({ username }).select('_id').lean();
+    if (usernameExists) {
+      return NextResponse.json({ error: '该用户名已被使用' }, { status: 409 });
+    }
+
+    const hashed = await bcrypt.hash(password, 12);
+
+    const created = await User.create({
+      username,
+      email,
+      password: hashed,
+      role,
+      tags: [],
+    });
+
+    await AdminLog.create({
+      adminId: owner.id,
+      adminUsername: owner.name,
+      action: 'CREATE_USER',
+      targetType: 'USER',
+      targetId: created._id.toString(),
+      details: JSON.stringify({ username, email, role }),
+      meta: {
+        createdUser: { username, email, role },
+        userAgent: request.headers.get('user-agent') || undefined,
+        path: '/api/admin/users',
+        method: 'POST',
+      },
+      ipAddress: getRequestIp(request) || undefined,
+    });
+
+    const safeUser = await User.findById(created._id).select('-password');
+    return NextResponse.json(safeUser, { status: 201 });
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Forbidden: Owner access required') {
+      return NextResponse.json({ error: '未授权' }, { status: 403 });
+    }
+
+    console.error('Error creating user:', error);
+    return NextResponse.json({ error: '创建用户失败' }, { status: 500 });
+  }
+}
+
+export async function PATCH(request: Request) {
+  try {
+    const admin = await requireAdmin();
+    const { userId, updates } = await request.json();
+    
+    await dbConnect();
+
+    const existing = await User.findById(userId).select('role username');
+    if (!existing) {
+      return NextResponse.json({ error: '用户不存在' }, { status: 404 });
+    }
+
+    // Proteger cuentas OWNER: solo un OWNER puede modificarlas
+    if (existing.role === 'OWNER' && admin.role !== 'OWNER') {
+      return NextResponse.json({ error: '未授权' }, { status: 403 });
+    }
+
+    const allowedKeys = new Set([
+      'role',
+      'isBanned',
+      'bannedReason',
+      'tags',
+      'badges',
+      'verified',
+      'username',
+      'balance',
+      'followersCountOverride',
+      'followingCountOverride',
+    ]);
+    const sanitizedUpdates: Record<string, any> = {};
+
+    for (const [key, value] of Object.entries(updates || {})) {
+      if (allowedKeys.has(key)) {
+        sanitizedUpdates[key] = value;
+      }
+    }
+
+    // Badges: solo OWNER puede modificarlos
+    if (typeof sanitizedUpdates.badges !== 'undefined') {
+      if (admin.role !== 'OWNER') {
+        return NextResponse.json({ error: '未授权' }, { status: 403 });
+      }
+
+      const incoming = sanitizedUpdates.badges;
+      const list = Array.isArray(incoming)
+        ? incoming
+        : typeof incoming === 'string'
+          ? incoming.split(',')
+          : [];
+
+      const cleaned = list
+        .map((b) => (typeof b === 'string' ? b.trim() : ''))
+        .filter(Boolean)
+        .map((b) => b.toLowerCase().replace(/\s+/g, '_').replace(/-+/g, '_'))
+        .slice(0, 10);
+
+      const unique = Array.from(new Set(cleaned));
+      if (unique.length === 0) {
+        sanitizedUpdates.badges = [];
+      } else {
+        const existingBadges = await Badge.find({ slug: { $in: unique }, enabled: true })
+          .select('slug')
+          .lean();
+
+        const allowedSlugs = new Set(existingBadges.map((b: any) => String(b.slug)));
+        sanitizedUpdates.badges = unique.filter((s) => allowedSlugs.has(s)).slice(0, 10);
+      }
+    }
+
+    if (typeof sanitizedUpdates.username !== 'undefined') {
+      if (typeof sanitizedUpdates.username !== 'string') {
+        return NextResponse.json({ error: '用户名无效' }, { status: 400 });
+      }
+
+      const nextUsername = sanitizedUpdates.username.trim().replace(/^@+/, '');
+      if (!/^[a-zA-Z0-9_]{3,20}$/.test(nextUsername)) {
+        return NextResponse.json(
+          { error: '用户名无效（3-20位，字母/数字/_）' },
+          { status: 400 }
+        );
+      }
+
+      const currentUsername = String((existing as any).username || '');
+      if (currentUsername.toLowerCase() === nextUsername.toLowerCase()) {
+        delete sanitizedUpdates.username;
+      } else {
+        const taken = await User.findOne({
+          _id: { $ne: userId },
+          username: { $regex: new RegExp(`^${escapeRegex(nextUsername)}$`, 'i') },
+        })
+          .select('_id')
+          .lean();
+
+        if (taken) {
+          return NextResponse.json({ error: '该用户名已被使用' }, { status: 409 });
+        }
+
+        sanitizedUpdates.username = nextUsername;
+        sanitizedUpdates.usernameLastChangedAt = new Date();
+      }
+    }
+
+    // Tags: solo OWNER puede modificarlos
+    if (typeof sanitizedUpdates.tags !== 'undefined') {
+      if (admin.role !== 'OWNER') {
+        return NextResponse.json({ error: '未授权' }, { status: 403 });
+      }
+
+      const incoming = sanitizedUpdates.tags;
+      const list = Array.isArray(incoming) ? incoming : [];
+      const cleaned = list
+        .map((t) => (typeof t === 'string' ? t.trim() : ''))
+        .filter(Boolean)
+        .slice(0, 20)
+        .map((t) => t.slice(0, 24));
+
+      sanitizedUpdates.tags = Array.from(new Set(cleaned));
+    }
+
+    // Verified: solo OWNER puede cambiarlo
+    if (typeof sanitizedUpdates.verified !== 'undefined') {
+      if (admin.role !== 'OWNER') {
+        return NextResponse.json({ error: '未授权' }, { status: 403 });
+      }
+      sanitizedUpdates.verified = Boolean(sanitizedUpdates.verified);
+    }
+
+    // Balance / follower overrides: solo OWNER puede cambiarlos
+    if (
+      typeof sanitizedUpdates.balance !== 'undefined' ||
+      typeof sanitizedUpdates.followersCountOverride !== 'undefined' ||
+      typeof sanitizedUpdates.followingCountOverride !== 'undefined'
+    ) {
+      if (admin.role !== 'OWNER') {
+        return NextResponse.json({ error: '未授权' }, { status: 403 });
+      }
+
+      const parseNumOrNull = (v: any) => {
+        if (v === null || v === '') return null;
+        if (typeof v === 'number') return v;
+        if (typeof v === 'string' && v.trim() !== '') return Number(v);
+        return undefined;
+      };
+
+      if (typeof sanitizedUpdates.balance !== 'undefined') {
+        const n = parseNumOrNull(sanitizedUpdates.balance);
+        if (n === undefined || n === null || !Number.isFinite(n) || n < 0 || n > 1_000_000_000) {
+          return NextResponse.json({ error: '余额无效' }, { status: 400 });
+        }
+        sanitizedUpdates.balance = Math.floor(n);
+      }
+
+      if (typeof sanitizedUpdates.followersCountOverride !== 'undefined') {
+        const n = parseNumOrNull(sanitizedUpdates.followersCountOverride);
+        if (n !== null && (n === undefined || !Number.isFinite(n) || n < 0 || n > 1_000_000_000)) {
+          return NextResponse.json({ error: '覆盖配置无效' }, { status: 400 });
+        }
+        sanitizedUpdates.followersCountOverride = n === null ? null : Math.floor(n);
+      }
+
+      if (typeof sanitizedUpdates.followingCountOverride !== 'undefined') {
+        const n = parseNumOrNull(sanitizedUpdates.followingCountOverride);
+        if (n !== null && (n === undefined || !Number.isFinite(n) || n < 0 || n > 1_000_000_000)) {
+          return NextResponse.json({ error: '覆盖配置无效' }, { status: 400 });
+        }
+        sanitizedUpdates.followingCountOverride = n === null ? null : Math.floor(n);
+      }
+    }
+
+    if (typeof sanitizedUpdates.role === 'string') {
+      const role = sanitizedUpdates.role;
+      if (!['USER', 'STAFF', 'ADMIN', 'OWNER'].includes(role)) {
+        return NextResponse.json({ error: '角色无效' }, { status: 400 });
+      }
+
+      // Solo un OWNER puede asignar o quitar OWNER
+      if ((role === 'OWNER' || existing.role === 'OWNER') && admin.role !== 'OWNER') {
+        return NextResponse.json({ error: '未授权' }, { status: 403 });
+      }
+    }
+
+    if (typeof sanitizedUpdates.isBanned !== 'undefined') {
+      sanitizedUpdates.isBanned = Boolean(sanitizedUpdates.isBanned);
+    }
+
+    if (Object.keys(sanitizedUpdates).length === 0) {
+      return NextResponse.json({ error: 'Sin cambios' }, { status: 400 });
+    }
+    
+    const user = await User.findByIdAndUpdate(userId, sanitizedUpdates, { returnDocument: 'after', runValidators: true })
+      .select('-password');
+
+    if (!user) {
+      return NextResponse.json({ error: '用户不存在' }, { status: 404 });
+    }
+    
+    // Log action
+    await AdminLog.create({
+      adminId: admin.id,
+      adminUsername: admin.name,
+      action: 'UPDATE_USER',
+      targetType: 'USER',
+      targetId: userId,
+      details: JSON.stringify(sanitizedUpdates),
+      meta: {
+        updates: sanitizedUpdates,
+        userAgent: request.headers.get('user-agent') || undefined,
+        path: '/api/admin/users',
+        method: 'PATCH',
+      },
+      ipAddress: getRequestIp(request) || undefined,
+    });
+    
+    return NextResponse.json(user);
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Forbidden: Admin access required') {
+      return NextResponse.json({ error: '未授权' }, { status: 403 });
+    }
+    
+    console.error('Error updating user:', error);
+    return NextResponse.json(
+      { error: '更新用户失败' },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE(request: Request) {
+  try {
+    const admin = await requireAdmin();
+    const { userId } = await request.json();
+
+    if (!userId || typeof userId !== 'string') {
+      return NextResponse.json({ error: 'userId requerido' }, { status: 400 });
+    }
+
+    if (admin.id === userId) {
+      return NextResponse.json({ error: '不能删除自己的账号' }, { status: 400 });
+    }
+
+    await dbConnect();
+
+    const existing = await User.findById(userId).select('role username email');
+    if (!existing) {
+      return NextResponse.json({ error: '用户不存在' }, { status: 404 });
+    }
+
+    // Proteger cuentas OWNER: solo un OWNER puede eliminarlas
+    if (existing.role === 'OWNER' && admin.role !== 'OWNER') {
+      return NextResponse.json({ error: '未授权' }, { status: 403 });
+    }
+
+    await User.deleteOne({ _id: userId });
+
+    await AdminLog.create({
+      adminId: admin.id,
+      adminUsername: admin.name,
+      action: 'DELETE_USER',
+      targetType: 'USER',
+      targetId: userId,
+      details: JSON.stringify({ deletedUser: { username: existing.username, email: existing.email, role: existing.role } }),
+      meta: {
+        deletedUser: { username: existing.username, email: existing.email, role: existing.role },
+        userAgent: request.headers.get('user-agent') || undefined,
+        path: '/api/admin/users',
+        method: 'DELETE',
+      },
+      ipAddress: getRequestIp(request) || undefined,
+    });
+
+    return NextResponse.json({ ok: true });
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Forbidden: Admin access required') {
+      return NextResponse.json({ error: '未授权' }, { status: 403 });
+    }
+
+    console.error('Error deleting user:', error);
+    return NextResponse.json({ error: '删除用户失败' }, { status: 500 });
+  }
+}

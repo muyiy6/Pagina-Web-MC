@@ -1,0 +1,247 @@
+import { NextResponse } from 'next/server';
+import { z } from 'zod';
+import dbConnect from '@/lib/mongodb';
+import ShopOrder from '@/models/ShopOrder';
+import { resolveMinecraftAccount } from '@/lib/minecraftAccount';
+import { getCurrentUser } from '@/lib/session';
+import { getStripe, toStripeAmount } from '@/lib/stripe';
+import { ensureDeliveryForOrder } from '@/lib/deliveries';
+import { ensureStockDeductedForOrder } from '@/lib/stock';
+import { buildPricingFromItems } from '@/lib/shopPricing';
+import { applyOrderIncentives } from '@/lib/referrals';
+
+const schema = z.object({
+  minecraftUsername: z.string().min(1),
+  productId: z.string().min(1).optional(),
+  couponCode: z.string().max(40).optional(),
+  items: z
+    .array(
+      z.object({
+        productId: z.string().min(1),
+        quantity: z.number().int().min(1).max(99),
+      })
+    )
+    .optional(),
+});
+
+function getSiteUrl(request: Request): string {
+  const fromEnv = String(process.env.SITE_URL || process.env.NEXTAUTH_URL || '').trim();
+  if (fromEnv) return fromEnv.replace(/\/$/, '');
+  return new URL(request.url).origin;
+}
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const parsed = schema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json({ error: '数据无效' }, { status: 400 });
+    }
+
+    const rawItems =
+      parsed.data.items && parsed.data.items.length
+        ? parsed.data.items
+        : parsed.data.productId
+          ? [{ productId: parsed.data.productId, quantity: 1 }]
+          : [];
+
+    if (!rawItems.length) {
+      return NextResponse.json({ error: '数据无效' }, { status: 400 });
+    }
+
+    const onlineMode = (process.env.MC_ONLINE_MODE || 'true').toLowerCase() !== 'false';
+    const resolved = await resolveMinecraftAccount({
+      usernameRaw: parsed.data.minecraftUsername,
+      onlineMode,
+      timeoutMs: 5000,
+    });
+
+    if (!resolved) {
+      return NextResponse.json({ error: 'Minecraft 用户无效或不存在' }, { status: 400 });
+    }
+
+    await dbConnect();
+
+    const user = await getCurrentUser().catch(() => null);
+
+    let pricing;
+    try {
+      pricing = await buildPricingFromItems({
+        rawItems,
+        couponCode: parsed.data.couponCode,
+        buyerUserId: user?.id || '',
+      });
+    } catch (err: any) {
+      const msg = String(err?.message || 'Error');
+      if (msg === '商品不存在') return NextResponse.json({ error: msg }, { status: 404 });
+      if (msg === 'Sin stock suficiente') {
+        const meta = (err as any)?.meta || {};
+        return NextResponse.json({ error: msg, ...meta }, { status: 409 });
+      }
+      return NextResponse.json({ error: msg }, { status: 400 });
+    }
+
+    const orderItems = pricing.orderItems;
+    const totalPrice = pricing.totalPrice;
+    if (!Number.isFinite(totalPrice) || totalPrice < 0) {
+      return NextResponse.json({ error: '总额无效' }, { status: 400 });
+    }
+
+    // Stripe has minimum charge amounts (e.g. ~0.50 EUR). If the order is truly free,
+    // we bypass Stripe and enqueue delivery immediately.
+    if (totalPrice === 0) {
+      const first = orderItems[0];
+
+      const headers = new Headers(request.headers);
+      const ip = headers.get('x-forwarded-for')?.split(',')[0]?.trim() || headers.get('x-real-ip') || '';
+      const userAgent = headers.get('user-agent') || '';
+
+      const order = await ShopOrder.create({
+        userId: user?.id || '',
+        minecraftUsername: resolved.username,
+        minecraftUuid: resolved.uuid,
+        productId: first?.productId || '',
+        productName: first?.productName || '',
+        productPrice: first?.unitPrice || 0,
+        items: orderItems,
+        subtotalPrice: pricing.subtotal,
+        totalPrice,
+        couponCode: pricing.coupon?.code || '',
+        couponType: pricing.coupon?.type || '',
+        couponValue: pricing.coupon?.value || 0,
+        couponDiscountAmount: pricing.coupon?.discountAmount || 0,
+        referralCode: pricing.referral?.code || '',
+        referralReferrerUserId: pricing.referral?.referrerUserId || '',
+        referralDiscountPercent: pricing.referral?.discountPercent || 0,
+        referralDiscountAmount: pricing.referral?.discountAmount || 0,
+        referralRewardAmount: pricing.referral?.rewardAmount || 0,
+        currency: String(process.env.SHOP_CURRENCY || 'EUR').toUpperCase(),
+        status: 'PAID',
+        provider: 'MANUAL',
+        paidAt: new Date(),
+        ip,
+        userAgent,
+      });
+
+      const stockRes = await ensureStockDeductedForOrder(String(order._id));
+      if (!stockRes.ok) {
+        await ShopOrder.updateOne(
+          { _id: order._id },
+          {
+            $set: {
+              stockDeductionError: stockRes.error.message,
+            },
+          }
+        );
+        return NextResponse.json({ error: 'Sin stock suficiente' }, { status: 409 });
+      }
+
+      await ensureDeliveryForOrder(String(order._id));
+      await applyOrderIncentives(String(order._id));
+
+      return NextResponse.json({ free: true, orderId: String(order._id), status: 'PAID' });
+    }
+
+    const first = orderItems[0];
+
+    const headers = new Headers(request.headers);
+    const ip = headers.get('x-forwarded-for')?.split(',')[0]?.trim() || headers.get('x-real-ip') || '';
+    const userAgent = headers.get('user-agent') || '';
+
+    const order = await ShopOrder.create({
+      userId: user?.id || '',
+      minecraftUsername: resolved.username,
+      minecraftUuid: resolved.uuid,
+      productId: first?.productId || '',
+      productName: first?.productName || '',
+      productPrice: first?.unitPrice || 0,
+      items: orderItems,
+      subtotalPrice: pricing.subtotal,
+      totalPrice,
+      couponCode: pricing.coupon?.code || '',
+      couponType: pricing.coupon?.type || '',
+      couponValue: pricing.coupon?.value || 0,
+      couponDiscountAmount: pricing.coupon?.discountAmount || 0,
+      referralCode: pricing.referral?.code || '',
+      referralReferrerUserId: pricing.referral?.referrerUserId || '',
+      referralDiscountPercent: pricing.referral?.discountPercent || 0,
+      referralDiscountAmount: pricing.referral?.discountAmount || 0,
+      referralRewardAmount: pricing.referral?.rewardAmount || 0,
+      currency: String(process.env.SHOP_CURRENCY || 'EUR').toUpperCase(),
+      status: 'PENDING',
+      provider: 'STRIPE',
+      ip,
+      userAgent,
+    });
+
+    const siteUrl = getSiteUrl(request);
+
+    const stripe = getStripe();
+    const currency = String((order as any).currency || 'EUR').toLowerCase();
+
+    // Provide a clearer error than Stripe's when below common minimums.
+    // For EUR, Stripe requires at least 0.50.
+    if (currency === 'eur') {
+      const totalCents = orderItems.reduce((sum, it) => sum + Math.round(Number(it.unitPrice || 0) * 100) * Number(it.quantity || 1), 0);
+      if (totalCents > 0 && totalCents < 50) {
+        return NextResponse.json(
+          { error: 'Stripe no permite pagos menores de 0,50€. Pon el producto a 0€ (gratis) o sube el precio.' },
+          { status: 400 }
+        );
+      }
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: orderItems.map((it) => ({
+        quantity: it.quantity,
+        price_data: {
+          currency,
+          unit_amount: toStripeAmount(it.unitPrice),
+          product_data: {
+            name: it.productName || 'Producto',
+          },
+        },
+      })),
+      client_reference_id: String(order._id),
+      metadata: {
+        orderId: String(order._id),
+      },
+      payment_intent_data: {
+        metadata: {
+          orderId: String(order._id),
+        },
+      },
+      customer_email: user?.email ? String(user.email) : undefined,
+      success_url: `${siteUrl}/carrito/stripe/success?orderId=${encodeURIComponent(String(order._id))}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${siteUrl}/carrito/stripe/cancel?orderId=${encodeURIComponent(String(order._id))}`,
+    });
+
+    await ShopOrder.updateOne(
+      { _id: order._id },
+      {
+        $set: {
+          stripeCheckoutSessionId: String(session.id || ''),
+          stripeStatus: String((session as any).status || ''),
+          stripePaymentStatus: String((session as any).payment_status || ''),
+        },
+      }
+    );
+
+    const url = String((session as any).url || '').trim();
+    if (!url) {
+      return NextResponse.json({ error: 'No se pudo iniciar el pago' }, { status: 500 });
+    }
+
+    return NextResponse.json({
+      orderId: String(order._id),
+      sessionId: String(session.id || ''),
+      url,
+    });
+  } catch (error: any) {
+    console.error('Stripe create session error:', error);
+    return NextResponse.json({ error: error?.message || '创建 Stripe 支付失败' }, { status: 500 });
+  }
+}
+
+export const runtime = 'nodejs';

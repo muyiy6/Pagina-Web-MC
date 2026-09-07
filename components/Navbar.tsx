@@ -1,0 +1,1045 @@
+
+'use client';
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import { signOut, useSession } from 'next-auth/react';
+import { motion, AnimatePresence } from 'framer-motion';
+import LanguageSwitcher from '@/components/LanguageSwitcher';
+import ThemeToggle from '@/components/ThemeToggle';
+import { t } from '@/lib/i18n';
+import { useClientLang } from '@/lib/useClientLang';
+import { formatPrice } from '@/lib/utils';
+import { 
+  FaHome, 
+  FaShoppingCart, 
+  FaBook, 
+  FaNewspaper, 
+  FaEnvelope, 
+  FaVoteYea,
+  FaComments,
+  FaBell,
+  FaShieldAlt,
+  FaUser, 
+  FaSignOutAlt, 
+  FaSignInAlt, 
+  FaBars, 
+  FaTimes,
+  FaCog,
+  FaTrash,
+} from 'react-icons/fa';
+
+const Navbar = () => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [brandIconStatus, setBrandIconStatus] = useState<'ok' | 'error'>('ok');
+  const pathname = usePathname();
+  const { data: session } = useSession();
+  const lang = useClientLang();
+  const [mounted, setMounted] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [notifOpenDesktop, setNotifOpenDesktop] = useState(false);
+  const [notifOpenMobile, setNotifOpenMobile] = useState(false);
+  const [notifLoading, setNotifLoading] = useState(false);
+  const [notifItems, setNotifItems] = useState<any[]>([]);
+  const notifRef = useRef<HTMLDivElement | null>(null);
+  const notifOpenDesktopRef = useRef(false);
+  const notifOpenMobileRef = useRef(false);
+  const notifStreamRef = useRef<EventSource | null>(null);
+
+  type CartItem = { productId: string; quantity: number };
+  type Product = { _id: string; name: string; price: number; image?: string };
+
+  const [cartOpenDesktop, setCartOpenDesktop] = useState(false);
+  const [cartOpenMobile, setCartOpenMobile] = useState(false);
+  const [cartLoading, setCartLoading] = useState(false);
+  const [cartItems, setCartItems] = useState<CartItem[]>([]);
+  const [cartProducts, setCartProducts] = useState<Product[]>([]);
+  const cartRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  useEffect(() => {
+    setNotifOpenDesktop(false);
+    setNotifOpenMobile(false);
+    setCartOpenDesktop(false);
+    setCartOpenMobile(false);
+    setIsOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    notifOpenDesktopRef.current = notifOpenDesktop;
+  }, [notifOpenDesktop]);
+
+  useEffect(() => {
+    notifOpenMobileRef.current = notifOpenMobile;
+  }, [notifOpenMobile]);
+
+  useEffect(() => {
+    const onDocMouseDown = (e: MouseEvent) => {
+      if (notifOpenDesktop) {
+        const el = notifRef.current;
+        if (el && e.target instanceof Node && !el.contains(e.target)) setNotifOpenDesktop(false);
+      }
+      if (cartOpenDesktop) {
+        const el = cartRef.current;
+        if (el && e.target instanceof Node && !el.contains(e.target)) setCartOpenDesktop(false);
+      }
+    };
+
+    document.addEventListener('mousedown', onDocMouseDown);
+    return () => document.removeEventListener('mousedown', onDocMouseDown);
+  }, [notifOpenDesktop, cartOpenDesktop]);
+
+  const localCartKey = 'shop.cart.items';
+
+  const normalizeCart = (items: CartItem[]): CartItem[] => {
+    const map = new Map<string, number>();
+    for (const it of items) {
+      const id = String(it.productId || '').trim();
+      const qty = Math.floor(Number(it.quantity || 0));
+      if (!id || !Number.isFinite(qty) || qty <= 0) continue;
+      map.set(id, Math.min(99, (map.get(id) || 0) + qty));
+    }
+    return Array.from(map.entries()).map(([productId, quantity]) => ({ productId, quantity }));
+  };
+
+  const readLocalCart = (): CartItem[] => {
+    try {
+      const raw = localStorage.getItem(localCartKey);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      return normalizeCart(
+        parsed
+          .map((it: any) => ({ productId: String(it?.productId || ''), quantity: Number(it?.quantity || 0) }))
+          .filter((it: CartItem) => Boolean(it.productId) && Number.isFinite(it.quantity) && it.quantity > 0)
+      );
+    } catch {
+      return [];
+    }
+  };
+
+  const writeLocalCart = (items: CartItem[]) => {
+    try {
+      localStorage.setItem(localCartKey, JSON.stringify(items));
+      window.dispatchEvent(new Event('shop-cart-updated'));
+    } catch {
+      // ignore
+    }
+  };
+
+  const loadCart = async () => {
+    setCartLoading(true);
+    try {
+      if (session?.user) {
+        const res = await fetch('/api/shop/cart', { cache: 'no-store' });
+        const data = await res.json().catch(() => ({}));
+        const serverItems = res.ok && Array.isArray((data as any).items) ? ((data as any).items as CartItem[]) : [];
+        setCartItems(normalizeCart(serverItems || []));
+      } else {
+        setCartItems(readLocalCart());
+      }
+    } catch {
+      setCartItems([]);
+    } finally {
+      setCartLoading(false);
+    }
+  };
+
+  const persistCart = async (items: CartItem[]) => {
+    const normalized = normalizeCart(items);
+    setCartItems(normalized);
+
+    if (session?.user) {
+      // Keep local cart empty when using server-side cart
+      try {
+        localStorage.setItem(localCartKey, JSON.stringify([]));
+      } catch {
+        // ignore
+      }
+
+      try {
+        await fetch('/api/shop/cart', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: normalized }),
+        });
+        window.dispatchEvent(new Event('shop-cart-updated'));
+      } catch {
+        // ignore
+      }
+    } else {
+      writeLocalCart(normalized);
+    }
+  };
+
+  const removeFromCart = async (productId: string) => {
+    const next = cartItems.filter((it) => String(it.productId) !== String(productId));
+    await persistCart(next);
+  };
+
+  const loadProductsIfNeeded = async () => {
+    if (cartProducts.length) return;
+    try {
+      const res = await fetch('/api/products', { cache: 'no-store' });
+      const data = await res.json().catch(() => ([]));
+      setCartProducts(Array.isArray(data) ? data : []);
+    } catch {
+      setCartProducts([]);
+    }
+  };
+
+  useEffect(() => {
+    loadCart();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.user, pathname]);
+
+  useEffect(() => {
+    const onCartUpdated = () => loadCart();
+    window.addEventListener('shop-cart-updated', onCartUpdated);
+    return () => window.removeEventListener('shop-cart-updated', onCartUpdated);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.user]);
+
+  const cartTotalQty = useMemo(() => cartItems.reduce((sum, it) => sum + Number(it.quantity || 0), 0), [cartItems]);
+
+  const cartProductById = useMemo(() => {
+    return new Map<string, Product>(cartProducts.map((p) => [String(p._id), p]));
+  }, [cartProducts]);
+
+  const cartTotalPrice = useMemo(() => {
+    return cartItems.reduce((sum, it) => {
+      const p = cartProductById.get(String(it.productId));
+      return sum + Number(p?.price || 0) * Number(it.quantity || 0);
+    }, 0);
+  }, [cartItems, cartProductById]);
+
+  const fetchNotifications = async () => {
+    if (!session?.user) {
+      setUnreadCount(0);
+      setNotifItems([]);
+      return;
+    }
+
+    setNotifLoading(true);
+    try {
+      const res = await fetch('/api/notifications', { cache: 'no-store' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error((data as any).error || 'Error');
+
+      setUnreadCount(typeof (data as any).unreadCount === 'number' ? (data as any).unreadCount : 0);
+      setNotifItems(Array.isArray((data as any).items) ? (data as any).items : []);
+    } catch {
+      setUnreadCount(0);
+      setNotifItems([]);
+    } finally {
+      setNotifLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    // Keep counter reasonably fresh when logged in.
+    fetchNotifications();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.user, pathname]);
+
+  useEffect(() => {
+    if (!session?.user || typeof window === 'undefined') {
+      if (notifStreamRef.current) {
+        notifStreamRef.current.close();
+        notifStreamRef.current = null;
+      }
+      return;
+    }
+
+    const es = new EventSource('/api/notifications/stream');
+    notifStreamRef.current = es;
+
+    const onNotifications = (event: MessageEvent) => {
+      try {
+        const payload = JSON.parse(event.data || '{}');
+        const count = typeof payload?.unreadCount === 'number' ? payload.unreadCount : 0;
+        setUnreadCount(Math.max(0, count));
+
+        // Keep list fresh while notifications panel is open.
+        if (notifOpenDesktopRef.current || notifOpenMobileRef.current) {
+          void fetchNotifications();
+        }
+      } catch {
+        // ignore malformed events
+      }
+    };
+
+    es.addEventListener('notifications', onNotifications as EventListener);
+
+    return () => {
+      es.removeEventListener('notifications', onNotifications as EventListener);
+      es.close();
+      if (notifStreamRef.current === es) {
+        notifStreamRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.user]);
+
+  const markAllRead = async () => {
+    if (!session?.user) return;
+    try {
+      const res = await fetch('/api/notifications', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ all: true }),
+      });
+      if (!res.ok) return;
+      setUnreadCount(0);
+      setNotifItems([]);
+    } catch {
+      // ignore
+    }
+  };
+
+  const markOneRead = async (id: string) => {
+    if (!session?.user) return;
+    try {
+      const res = await fetch('/api/notifications', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [id] }),
+      });
+      if (!res.ok) return;
+      setNotifItems((prev) => prev.filter((n: any) => n._id !== id));
+      setUnreadCount((c) => Math.max(0, c - 1));
+    } catch {
+      // ignore
+    }
+  };
+
+  const navItems = [
+    { name: t(lang, 'nav.home'), href: '/', icon: FaHome },
+    { name: t(lang, 'nav.shop'), href: '/tienda', icon: FaShoppingCart },
+    { name: t(lang, 'nav.vote'), href: '/vote', icon: FaVoteYea },
+    { name: t(lang, 'nav.rules'), href: '/normas', icon: FaBook },
+    { name: t(lang, 'nav.news'), href: '/noticias', icon: FaNewspaper },
+    { name: t(lang, 'nav.forum'), href: '/foro', icon: FaComments },
+    { name: t(lang, 'nav.partner'), href: '/partner', icon: FaShieldAlt },
+    { name: t(lang, 'nav.support'), href: '/soporte', icon: FaEnvelope },
+  ];
+
+  const isActive = (href: string) => pathname === href;
+
+  const mobileDrawer = (
+    <AnimatePresence>
+      {isOpen && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="md:hidden fixed inset-0 z-[1000]"
+        >
+          <div
+            className="absolute inset-0 bg-black/60"
+            onClick={() => {
+              setIsOpen(false);
+              setNotifOpenMobile(false);
+            }}
+          />
+
+          <motion.div
+            initial={{ x: -360 }}
+            animate={{ x: 0 }}
+            exit={{ x: -360 }}
+            transition={{ type: 'tween', duration: 0.2 }}
+            className="absolute inset-y-0 left-0 w-[80vw] max-w-[340px] bg-gray-950/95 backdrop-blur-sm border-r border-minecraft-diamond/15 shadow-xl"
+          >
+            <div className="h-full flex flex-col">
+              <div className="px-4 py-4 border-b border-white/10 flex items-center justify-between gap-3">
+                <Link
+                  href="/"
+                  onClick={() => {
+                    setIsOpen(false);
+                    setNotifOpenMobile(false);
+                  }}
+                  className="flex items-center gap-3 min-w-0"
+                >
+                  <div
+                    className={`w-9 h-9 rounded-md flex items-center justify-center overflow-hidden relative ${
+                      brandIconStatus === 'ok' ? 'bg-transparent' : 'bg-minecraft-grass'
+                    }`}
+                  >
+                    {brandIconStatus !== 'error' && (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src="/icon.png"
+                        alt=""
+                        className="absolute inset-0 w-full h-full object-cover"
+                        onError={() => setBrandIconStatus('error')}
+                      />
+                    )}
+                    {brandIconStatus === 'ok' ? null : <span className="text-white font-bold text-lg">MC</span>}
+                  </div>
+                  <div className="text-white font-bold truncate">999Wrld Network</div>
+                </Link>
+
+                <button
+                  onClick={() => {
+                    setIsOpen(false);
+                    setNotifOpenMobile(false);
+                  }}
+                  className="p-2 rounded-md text-gray-300 hover:text-white hover:bg-white/10"
+                  aria-label="Close"
+                >
+                  <FaTimes size={20} />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto px-3 py-3">
+                <div className="space-y-2">
+                  {navItems.map((item) => {
+                    const Icon = item.icon;
+                    return (
+                      <Link
+                        key={item.name}
+                        href={item.href}
+                        onClick={() => {
+                          setIsOpen(false);
+                          setNotifOpenMobile(false);
+                        }}
+                        className={`block px-4 py-3 rounded-md text-base font-medium flex items-center space-x-3 ${
+                          isActive(item.href)
+                            ? 'bg-gradient-to-r from-minecraft-grass to-minecraft-diamond text-white'
+                            : 'text-gray-300 hover:bg-white/10 hover:text-white'
+                        }`}
+                      >
+                        <Icon />
+                        <span>{item.name}</span>
+                      </Link>
+                    );
+                  })}
+                </div>
+
+                <div className="mt-4 pt-4 border-t border-white/10 space-y-2">
+                  {session ? (
+                    <>
+                      {(session.user.role === 'ADMIN' || session.user.role === 'STAFF' || session.user.role === 'OWNER') && (
+                        <Link
+                          href="/admin"
+                          onClick={() => {
+                            setIsOpen(false);
+                            setNotifOpenMobile(false);
+                          }}
+                          className="block px-4 py-3 rounded-md text-base font-medium bg-minecraft-diamond/15 text-minecraft-diamond border border-minecraft-diamond/20 flex items-center space-x-3"
+                        >
+                          <FaCog />
+                          <span>{t(lang, 'user.adminPanel')}</span>
+                        </Link>
+                      )}
+
+                      <Link
+                        href="/perfil"
+                        onClick={() => {
+                          setIsOpen(false);
+                          setNotifOpenMobile(false);
+                        }}
+                        className="block px-4 py-3 rounded-md text-base font-medium text-gray-300 hover:bg-white/10 flex items-center space-x-3"
+                      >
+                        <FaUser />
+                        <div className="min-w-0">
+                          <div className="truncate text-white">
+                            {String((session.user as any).displayName || '').trim() || String((session.user as any).username || session.user.name || '').trim()}
+                          </div>
+                        </div>
+                      </Link>
+
+                      <button
+                        onClick={() => {
+                          const next = !notifOpenMobile;
+                          setNotifOpenMobile(next);
+                          setNotifOpenDesktop(false);
+                          if (next) fetchNotifications();
+                        }}
+                        className="w-full px-4 py-3 rounded-md text-base font-medium text-gray-300 hover:bg-white/10 flex items-center gap-3 transition-transform duration-200 hover:scale-[1.02]"
+                      >
+                        <FaBell />
+                        <span className="flex-1 text-left">{t(lang, 'nav.notifications')}</span>
+                        {unreadCount > 0 && (
+                          <span className="inline-flex items-center justify-center min-w-[20px] h-5 px-1.5 rounded-full bg-red-600 text-white text-xs font-bold">
+                            {unreadCount > 99 ? '99+' : unreadCount}
+                          </span>
+                        )}
+                      </button>
+
+                      <AnimatePresence>
+                        {notifOpenMobile && (
+                          <motion.div
+                            initial={{ opacity: 0, height: 0 }}
+                            animate={{ opacity: 1, height: 'auto' }}
+                            exit={{ opacity: 0, height: 0 }}
+                            className="overflow-hidden"
+                          >
+                            <div className="mt-2 rounded-lg border border-white/10 bg-black/40">
+                              <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+                                <div className="text-white font-semibold">{t(lang, 'nav.notifications')}</div>
+                                <button onClick={markAllRead} className="text-sm text-gray-300 hover:text-white">
+                                  {t(lang, 'notifications.markAllRead')}
+                                </button>
+                              </div>
+
+                              {notifLoading ? (
+                                <div className="px-4 py-4 text-sm text-gray-400">{t(lang, 'common.loading')}</div>
+                              ) : notifItems.length === 0 ? (
+                                <div className="px-4 py-4 text-sm text-gray-400">{t(lang, 'notifications.empty')}</div>
+                              ) : (
+                                <div className="max-h-[50vh] overflow-auto divide-y divide-white/10">
+                                  {notifItems.slice(0, 10).map((n: any) => {
+                                    const unread = true;
+                                    return (
+                                      <div key={n._id} className={`px-4 py-3 ${unread ? 'bg-white/5' : ''}`}>
+                                        <div className="flex items-start justify-between gap-3">
+                                          <div className="min-w-0">
+                                            <div className="text-sm font-semibold text-white truncate">{n.title}</div>
+                                            <div className="text-xs text-gray-300 mt-1 line-clamp-2">{n.message}</div>
+                                            {n.href && (
+                                              <Link
+                                                href={n.href}
+                                                className="inline-block mt-2 text-xs text-minecraft-grass hover:text-minecraft-grass/80"
+                                                onClick={() => {
+                                                  markOneRead(n._id);
+                                                  setIsOpen(false);
+                                                  setNotifOpenMobile(false);
+                                                }}
+                                              >
+                                                {t(lang, 'notifications.goToLink')}
+                                              </Link>
+                                            )}
+                                          </div>
+
+                                          {unread && (
+                                            <button
+                                              onClick={() => markOneRead(n._id)}
+                                              className="shrink-0 text-xs text-gray-300 hover:text-white"
+                                            >
+                                              {t(lang, 'notifications.markRead')}
+                                            </button>
+                                          )}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+                              )}
+
+                              <div className="px-4 py-3 border-t border-white/10 flex justify-end">
+                                <Link
+                                  href="/notificaciones"
+                                  className="text-sm text-gray-300 hover:text-white"
+                                  onClick={() => {
+                                    setIsOpen(false);
+                                    setNotifOpenMobile(false);
+                                  }}
+                                >
+                                  {t(lang, 'notifications.viewAll')}
+                                </Link>
+                              </div>
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+
+                      <button
+                        onClick={() => {
+                          setIsOpen(false);
+                          setNotifOpenMobile(false);
+                          signOut();
+                        }}
+                        className="w-full text-left px-4 py-3 rounded-md text-base font-medium text-red-400 hover:bg-red-500/20 flex items-center space-x-3"
+                      >
+                        <FaSignOutAlt />
+                        <span>{t(lang, 'user.logout')}</span>
+                      </button>
+                    </>
+                  ) : (
+                    <Link
+                      href="/auth/login"
+                      onClick={() => {
+                        setIsOpen(false);
+                        setNotifOpenMobile(false);
+                      }}
+                      className="block px-4 py-3 rounded-md text-base font-medium text-white bg-gradient-to-r from-minecraft-grass to-minecraft-diamond hover:from-minecraft-grass/90 hover:to-minecraft-diamond/90 ring-1 ring-white/10 text-center"
+                    >
+                      {t(lang, 'user.login')}
+                    </Link>
+                  )}
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+
+  return (
+    <>
+      <nav className="fixed top-0 left-0 right-0 z-50 bg-white/80 dark:bg-gray-950/60 backdrop-blur-sm border-b border-gray-200 dark:border-minecraft-diamond/20 shadow-sm shadow-black/10 dark:shadow-black/30">
+        <div className="w-full px-4 sm:px-6 lg:px-8">
+          <div className="flex items-center h-16 gap-4">
+          {/* Logo */}
+          <Link href="/" className="flex items-center space-x-3">
+            <div
+              className={`w-10 h-10 rounded-md flex items-center justify-center overflow-hidden relative ${
+                brandIconStatus === 'ok' ? 'bg-transparent' : 'bg-minecraft-grass'
+              }`}
+            >
+              {brandIconStatus !== 'error' && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src="/icon.png"
+                  alt=""
+                  className="absolute inset-0 w-full h-full object-cover"
+                  onError={() => setBrandIconStatus('error')}
+                />
+              )}
+              {brandIconStatus === 'ok' ? null : <span className="text-white font-bold text-xl">MC</span>}
+            </div>
+            <span className="text-gray-900 dark:text-white font-bold text-xl hidden sm:block">
+              999Wrld Network
+            </span>
+          </Link>
+
+          {/* Desktop Menu */}
+          <div className="hidden md:flex items-center space-x-1 flex-1 justify-center translate-x-6">
+            {navItems.map((item) => {
+              const Icon = item.icon;
+              return (
+                <Link
+                  key={item.name}
+                  href={item.href}
+                  className={`px-4 py-2 rounded-md text-sm font-medium transition-all duration-200 flex items-center space-x-2 ${
+                    isActive(item.href)
+                      ? 'bg-gradient-to-r from-minecraft-grass to-minecraft-diamond text-white'
+                      : 'text-gray-700 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-white/10 dark:hover:text-white'
+                  }`}
+                >
+                  <Icon />
+                  <span>{item.name}</span>
+                </Link>
+              );
+            })}
+          </div>
+
+          {/* Right Controls (desktop) */}
+          <div className="hidden md:flex items-center ml-auto">
+            <div className="flex items-center space-x-2">
+              {session ? (
+                <>
+                  {(session.user.role === 'ADMIN' || session.user.role === 'STAFF' || session.user.role === 'OWNER') && (
+                    <Link
+                      href="/admin"
+                          className="px-3 py-2 rounded-md text-sm font-medium bg-minecraft-diamond/15 text-minecraft-diamond border border-minecraft-diamond/20 hover:bg-minecraft-diamond/20 transition-all duration-200 flex items-center space-x-2"
+                    >
+                      <FaCog />
+                      <span>{t(lang, 'user.admin')}</span>
+                    </Link>
+                  )}
+                  <Link
+                    href="/perfil"
+                    className="px-3 py-2 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-100 hover:text-gray-900 dark:text-gray-300 dark:hover:bg-white/10 dark:hover:text-white transition-all duration-200 flex items-center space-x-2"
+                  >
+                    <FaUser />
+                    <div className="min-w-0 leading-tight">
+                      <div className="truncate">
+                        {String((session.user as any).displayName || '').trim() || String((session.user as any).username || session.user.name || '').trim()}
+                      </div>
+                    </div>
+                  </Link>
+                  <button
+                    onClick={() => signOut()}
+                    className="px-3 py-2 rounded-md text-sm font-medium text-red-400 hover:bg-red-500/20 transition-all duration-200 flex items-center space-x-2"
+                  >
+                    <FaSignOutAlt />
+                    <span>{t(lang, 'user.logout')}</span>
+                  </button>
+                </>
+              ) : (
+                <Link
+                  href="/auth/login"
+                  className="px-4 py-2 rounded-md text-sm font-medium text-white bg-gradient-to-r from-minecraft-grass to-minecraft-diamond bg-[length:200%_200%] bg-[position:0%_50%] hover:bg-[position:100%_50%] transition-[background-position] duration-700 hover:from-minecraft-grass/90 hover:to-minecraft-diamond/90 shadow-lg shadow-minecraft-diamond/20 ring-1 ring-white/10 transition-all duration-200 flex items-center space-x-2"
+                >
+                  <FaSignInAlt />
+                  <span>{t(lang, 'user.login')}</span>
+                </Link>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1 ml-3 pl-3 border-l border-gray-200 dark:border-white/10">
+              <div className="relative" ref={cartRef}>
+                <motion.button
+                  onClick={() => {
+                    const next = !cartOpenDesktop;
+                    setCartOpenDesktop(next);
+                    setCartOpenMobile(false);
+                    setNotifOpenDesktop(false);
+                    setNotifOpenMobile(false);
+                    if (next) {
+                      loadCart();
+                      loadProductsIfNeeded();
+                    }
+                  }}
+                  className="group relative p-2 rounded-md text-gray-700 hover:text-gray-900 hover:bg-gray-100 dark:text-gray-300 dark:hover:text-white dark:hover:bg-white/10 transition-colors"
+                  aria-label={lang === 'es' ? 'Carrito' : 'Cart'}
+                  whileHover={{ scale: 1.12, y: -1, rotate: [0, -12, 10, -8, 0] }}
+                  whileTap={{ scale: 0.98 }}
+                  transition={{ type: 'spring', stiffness: 520, damping: 28, rotate: { duration: 0.45, ease: 'easeInOut' } }}
+                >
+                  <span className="pointer-events-none absolute inset-0 rounded-md opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-gradient-to-r from-minecraft-grass/10 to-minecraft-diamond/10" />
+                  <span className="relative">
+                    <FaShoppingCart />
+                  </span>
+                  {cartTotalQty > 0 && (
+                    <span className="absolute -top-1 -right-1 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-minecraft-grass text-white text-[10px] font-bold">
+                      {cartTotalQty > 99 ? '99+' : cartTotalQty}
+                    </span>
+                  )}
+                </motion.button>
+
+                <AnimatePresence>
+                  {cartOpenDesktop && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 8 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 8 }}
+                      className="absolute right-0 mt-2 w-[420px] max-w-[92vw] rounded-2xl border border-gray-200/80 dark:border-white/10 bg-white/95 dark:bg-gray-950/90 backdrop-blur-md shadow-2xl overflow-hidden"
+                    >
+                      <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-white/10 bg-gradient-to-r from-gray-50 to-white dark:from-gray-900/60 dark:to-gray-950/40">
+                        <div className="text-gray-900 dark:text-white font-semibold text-lg">{lang === 'es' ? 'Carrito' : 'Cart'}</div>
+                        <div className="text-xs text-gray-600 dark:text-gray-300">{cartTotalQty} {lang === 'es' ? '件商品' : 'items'}</div>
+                      </div>
+
+                      {cartLoading ? (
+                        <div className="px-4 py-6 text-sm text-gray-600 dark:text-gray-400">{t(lang, 'common.loading')}</div>
+                      ) : cartItems.length === 0 ? (
+                        <div className="px-4 py-7">
+                          <div className="rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50 dark:bg-black/20 p-6 text-center">
+                            <div className="mx-auto h-14 w-14 rounded-xl grid place-items-center bg-minecraft-gold/15 text-minecraft-gold mb-3">
+                              <FaShoppingCart size={24} />
+                            </div>
+                            <div className="text-gray-900 dark:text-white font-semibold mb-1">
+                              {lang === 'es' ? 'Tu carrito esta vacio' : 'Your cart is empty'}
+                            </div>
+                            <div className="text-sm text-gray-600 dark:text-gray-400">
+                              {lang === 'es' ? '添加商品后可在此查看。' : 'Add products to see them here.'}
+                            </div>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="max-h-[60vh] overflow-auto px-3 py-3 space-y-2">
+                          {cartItems.slice(0, 6).map((it) => {
+                            const p = cartProductById.get(String(it.productId));
+                            const name = String(p?.name || (lang === 'es' ? 'Producto' : 'Product'));
+                            const line = Number(p?.price || 0) * Number(it.quantity || 0);
+                            return (
+                              <div key={it.productId} className="px-3 py-3 rounded-xl border border-gray-200 dark:border-white/10 bg-white dark:bg-white/5 hover:bg-gray-50 dark:hover:bg-white/10 transition-colors">
+                                <div className="flex items-center justify-between gap-3">
+                                  <div className="min-w-0">
+                                    <div className="text-sm font-semibold text-gray-900 dark:text-white truncate">{name}</div>
+                                    <div className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">x{it.quantity}</div>
+                                  </div>
+                                  <div className="flex items-center gap-2 shrink-0">
+                                    <div className="text-sm text-gray-700 dark:text-gray-200">{line > 0 ? formatPrice(line, lang === 'es' ? 'es-ES' : 'en-US') : ''}</div>
+                                    <button
+                                      type="button"
+                                      className="p-2 rounded-md text-red-400 hover:text-red-300 hover:bg-red-500/10 transition-colors"
+                                      aria-label={lang === 'es' ? 'Quitar' : 'Remove'}
+                                      onClick={() => removeFromCart(it.productId)}
+                                    >
+                                      <FaTrash size={14} />
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      <div className="px-4 py-3 border-t border-gray-200 dark:border-white/10 flex items-center justify-between gap-3">
+                        <div className="text-sm text-gray-700 dark:text-gray-300">
+                          {lang === 'es' ? 'Total' : 'Total'}:{' '}
+                          <span className="text-gray-900 dark:text-white font-semibold">{formatPrice(cartTotalPrice, lang === 'es' ? 'es-ES' : 'en-US')}</span>
+                        </div>
+                        <Link
+                          href="/carrito"
+                          className="px-3 py-2 rounded-md text-sm font-medium text-white bg-gradient-to-r from-minecraft-grass to-minecraft-diamond bg-[length:200%_200%] bg-[position:0%_50%] hover:bg-[position:100%_50%] transition-[background-position] duration-700 hover:from-minecraft-grass/90 hover:to-minecraft-diamond/90 ring-1 ring-white/10 transition-all duration-200"
+                          onClick={() => setCartOpenDesktop(false)}
+                        >
+                          {lang === 'es' ? 'Ver carrito' : 'View cart'}
+                        </Link>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {session?.user && (
+                <div className="relative" ref={notifRef}>
+                  <motion.button
+                    onClick={() => {
+                      const next = !notifOpenDesktop;
+                      setNotifOpenDesktop(next);
+                      setNotifOpenMobile(false);
+                      setCartOpenDesktop(false);
+                      setCartOpenMobile(false);
+                      if (next) fetchNotifications();
+                    }}
+                    className="group relative p-2 rounded-md text-gray-700 hover:text-gray-900 hover:bg-gray-100 dark:text-gray-300 dark:hover:text-white dark:hover:bg-white/10 transition-colors"
+                    aria-label={t(lang, 'nav.notifications')}
+                    whileHover={{ scale: 1.12, y: -1, x: [0, -2, 2, -2, 2, 0] }}
+                    whileTap={{ scale: 0.98 }}
+                    transition={{ type: 'spring', stiffness: 520, damping: 28, x: { duration: 0.35, ease: 'easeInOut' } }}
+                  >
+                    <span className="pointer-events-none absolute inset-0 rounded-md opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-gradient-to-r from-minecraft-diamond/10 to-minecraft-grass/10" />
+                    <span className="relative">
+                      <FaBell />
+                    </span>
+                    {unreadCount > 0 && (
+                      <span className="absolute -top-1 -right-1 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-red-600 text-white text-[10px] font-bold">
+                        {unreadCount > 99 ? '99+' : unreadCount}
+                      </span>
+                    )}
+                  </motion.button>
+
+                  <AnimatePresence>
+                    {notifOpenDesktop && (
+                      <motion.div
+                        initial={{ opacity: 0, y: 8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: 8 }}
+                        className="absolute right-0 mt-2 w-96 max-w-[90vw] rounded-xl border border-gray-200 dark:border-white/10 bg-white/95 dark:bg-gray-950/90 backdrop-blur-sm shadow-xl overflow-hidden"
+                      >
+                        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-white/10">
+                          <div className="text-gray-900 dark:text-white font-semibold">{t(lang, 'nav.notifications')}</div>
+                          <button onClick={markAllRead} className="text-sm text-gray-700 hover:text-gray-900 dark:text-gray-300 dark:hover:text-white">
+                            {t(lang, 'notifications.markAllRead')}
+                          </button>
+                        </div>
+
+                        {notifLoading ? (
+                          <div className="px-4 py-6 text-sm text-gray-600 dark:text-gray-400">{t(lang, 'common.loading')}</div>
+                        ) : notifItems.length === 0 ? (
+                          <div className="px-4 py-6 text-sm text-gray-600 dark:text-gray-400">{t(lang, 'notifications.empty')}</div>
+                        ) : (
+                          <div className="max-h-[60vh] overflow-auto">
+                            {notifItems.slice(0, 10).map((n: any) => {
+                              const unread = true;
+                              return (
+                                <div
+                                  key={n._id}
+                                  className={`px-4 py-3 border-b border-gray-100 dark:border-white/5 hover:bg-gray-50 dark:hover:bg-white/5 ${unread ? 'bg-gray-50 dark:bg-white/5' : ''}`}
+                                >
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                      <div className="text-sm font-semibold text-gray-900 dark:text-white truncate">{n.title}</div>
+                                      <div className="text-xs text-gray-700 dark:text-gray-300 mt-1 line-clamp-2">{n.message}</div>
+                                      {n.href && (
+                                        <Link
+                                          href={n.href}
+                                          className="inline-block mt-2 text-xs text-minecraft-grass hover:text-minecraft-grass/80"
+                                          onClick={() => {
+                                            markOneRead(n._id);
+                                            setNotifOpenDesktop(false);
+                                          }}
+                                        >
+                                          {t(lang, 'notifications.goToLink')}
+                                        </Link>
+                                      )}
+                                    </div>
+
+                                    {unread && (
+                                      <button
+                                        onClick={() => markOneRead(n._id)}
+                                        className="shrink-0 text-xs text-gray-700 hover:text-gray-900 dark:text-gray-300 dark:hover:text-white"
+                                      >
+                                        {t(lang, 'notifications.markRead')}
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        <div className="px-4 py-3 border-t border-gray-200 dark:border-white/10 flex justify-end">
+                          <Link
+                            href="/notificaciones"
+                            className="text-sm text-gray-700 hover:text-gray-900 dark:text-gray-300 dark:hover:text-white"
+                            onClick={() => setNotifOpenDesktop(false)}
+                          >
+                            {t(lang, 'notifications.viewAll')}
+                          </Link>
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+              )}
+              <ThemeToggle />
+              <LanguageSwitcher />
+            </div>
+          </div>
+
+          {/* Mobile controls */}
+          <div className="md:hidden flex items-center gap-1 ml-auto">
+            <div className="relative">
+              <motion.button
+                onClick={() => {
+                  const next = !cartOpenMobile;
+                  setCartOpenMobile(next);
+                  setCartOpenDesktop(false);
+                  setNotifOpenDesktop(false);
+                  setNotifOpenMobile(false);
+                  if (next) {
+                    loadCart();
+                    loadProductsIfNeeded();
+                  }
+                }}
+                className="group relative p-2 rounded-md text-gray-700 hover:text-gray-900 hover:bg-gray-100 dark:text-gray-300 dark:hover:text-white dark:hover:bg-white/10 transition-colors"
+                aria-label={lang === 'es' ? 'Carrito' : 'Cart'}
+                whileHover={{ scale: 1.12, y: -1, rotate: [0, -12, 10, -8, 0] }}
+                whileTap={{ scale: 0.98 }}
+                transition={{ type: 'spring', stiffness: 520, damping: 28, rotate: { duration: 0.45, ease: 'easeInOut' } }}
+              >
+                <span className="pointer-events-none absolute inset-0 rounded-md opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-gradient-to-r from-minecraft-grass/10 to-minecraft-diamond/10" />
+                <span className="relative">
+                  <FaShoppingCart size={20} />
+                </span>
+                {cartTotalQty > 0 && (
+                  <span className="absolute -top-1 -right-1 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-minecraft-grass text-white text-[10px] font-bold">
+                    {cartTotalQty > 99 ? '99+' : cartTotalQty}
+                  </span>
+                )}
+              </motion.button>
+
+              <AnimatePresence>
+                {cartOpenMobile && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: 8 }}
+                    className="fixed top-16 left-1/2 -translate-x-1/2 mt-2 w-[calc(100vw-1rem)] max-w-[420px] rounded-2xl border border-gray-200/80 dark:border-minecraft-diamond/20 bg-white/95 dark:bg-gray-950/90 backdrop-blur-md shadow-2xl overflow-hidden z-50"
+                  >
+                    <div className="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-white/10 bg-gradient-to-r from-gray-50 to-white dark:from-gray-900/60 dark:to-gray-950/40">
+                      <div className="text-gray-900 dark:text-white font-semibold text-lg">{lang === 'es' ? 'Carrito' : 'Cart'}</div>
+                      <div className="text-xs text-gray-600 dark:text-gray-300">{cartTotalQty} {lang === 'es' ? '件商品' : 'items'}</div>
+                    </div>
+
+                    {cartLoading ? (
+                      <div className="px-4 py-6 text-sm text-gray-600 dark:text-gray-400">{t(lang, 'common.loading')}</div>
+                    ) : cartItems.length === 0 ? (
+                      <div className="px-4 py-7">
+                        <div className="rounded-2xl border border-gray-200 dark:border-white/10 bg-gray-50 dark:bg-black/20 p-6 text-center">
+                          <div className="mx-auto h-14 w-14 rounded-xl grid place-items-center bg-minecraft-gold/15 text-minecraft-gold mb-3">
+                            <FaShoppingCart size={24} />
+                          </div>
+                          <div className="text-gray-900 dark:text-white font-semibold mb-1">
+                            {lang === 'es' ? 'Tu carrito esta vacio' : 'Your cart is empty'}
+                          </div>
+                          <div className="text-sm text-gray-600 dark:text-gray-400">
+                            {lang === 'es' ? '添加商品后可在此查看。' : 'Add products to see them here.'}
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="max-h-[50vh] overflow-auto px-3 py-3 space-y-2">
+                        {cartItems.slice(0, 5).map((it) => {
+                          const p = cartProductById.get(String(it.productId));
+                          const name = String(p?.name || (lang === 'es' ? 'Producto' : 'Product'));
+                          const line = Number(p?.price || 0) * Number(it.quantity || 0);
+                          return (
+                            <div key={it.productId} className="px-3 py-3 rounded-xl border border-gray-200 dark:border-white/10 bg-white dark:bg-white/5 hover:bg-gray-50 dark:hover:bg-white/10 transition-colors">
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div className="text-sm font-semibold text-gray-900 dark:text-white truncate">{name}</div>
+                                  <div className="text-xs text-gray-600 dark:text-gray-400 mt-0.5">x{it.quantity}</div>
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                  <div className="text-sm text-gray-700 dark:text-gray-200">{line > 0 ? formatPrice(line, lang === 'es' ? 'es-ES' : 'en-US') : ''}</div>
+                                  <button
+                                    type="button"
+                                    className="p-2 rounded-md text-red-400 hover:text-red-300 hover:bg-red-500/10 transition-colors"
+                                    aria-label={lang === 'es' ? 'Quitar' : 'Remove'}
+                                    onClick={() => removeFromCart(it.productId)}
+                                  >
+                                    <FaTrash size={14} />
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <div className="px-4 py-3 border-t border-gray-200 dark:border-white/10 flex items-center justify-between gap-3">
+                      <div className="text-sm text-gray-700 dark:text-gray-300">
+                        {lang === 'es' ? 'Total' : 'Total'}:{' '}
+                        <span className="text-gray-900 dark:text-white font-semibold">{formatPrice(cartTotalPrice, lang === 'es' ? 'es-ES' : 'en-US')}</span>
+                      </div>
+                      <Link
+                        href="/carrito"
+                        className="px-3 py-2 rounded-md text-sm font-medium text-white bg-gradient-to-r from-minecraft-grass to-minecraft-diamond bg-[length:200%_200%] bg-[position:0%_50%] hover:bg-[position:100%_50%] transition-[background-position] duration-700 hover:from-minecraft-grass/90 hover:to-minecraft-diamond/90 ring-1 ring-white/10 transition-all duration-200"
+                        onClick={() => setCartOpenMobile(false)}
+                      >
+                        {lang === 'es' ? 'Ver carrito' : 'View cart'}
+                      </Link>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+
+            {session?.user ? (
+              <Link
+                href="/notificaciones"
+                className="group relative p-2 rounded-md text-gray-700 hover:text-gray-900 hover:bg-gray-100 dark:text-gray-300 dark:hover:text-white dark:hover:bg-white/10 transition-colors"
+                aria-label={t(lang, 'nav.notifications')}
+                title={t(lang, 'nav.notifications')}
+              >
+                <span className="pointer-events-none absolute inset-0 rounded-md opacity-0 group-hover:opacity-100 transition-opacity duration-200 bg-gradient-to-r from-minecraft-diamond/10 to-minecraft-grass/10" />
+                <span className="relative">
+                  <FaBell size={20} />
+                </span>
+                {unreadCount > 0 && (
+                  <span className="absolute -top-1 -right-1 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 rounded-full bg-red-600 text-white text-[10px] font-bold">
+                    {unreadCount > 99 ? '99+' : unreadCount}
+                  </span>
+                )}
+              </Link>
+            ) : null}
+            <ThemeToggle />
+            <LanguageSwitcher />
+            <button
+              onClick={() => {
+                const next = !isOpen;
+                setIsOpen(next);
+                if (!next) setNotifOpenMobile(false);
+              }}
+              className="p-2 rounded-md text-gray-700 hover:text-gray-900 hover:bg-gray-100 dark:text-gray-300 dark:hover:text-white dark:hover:bg-white/10"
+            >
+              {isOpen ? <FaTimes size={24} /> : <FaBars size={24} />}
+            </button>
+          </div>
+        </div>
+      </div>
+      </nav>
+
+      {mounted && typeof document !== 'undefined' ? createPortal(mobileDrawer, document.body) : null}
+    </>
+  );
+};
+
+export default Navbar;
